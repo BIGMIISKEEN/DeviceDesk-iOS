@@ -1,0 +1,190 @@
+# Builds an unsigned .ipa of the DeviceDesk iPhone app on a GitHub-hosted Mac
+# and publishes it on this repository's Releases page.
+#
+# Start it by hand: Actions tab -> "iOS-ipa-build" -> Run workflow.
+#
+# The .ipa is NOT code-signed. It has to be signed when it is installed
+# (a sideloading tool with your Apple ID, or your organisation's signing/MDM).
+
+name: iOS-ipa-build
+
+on:
+  workflow_dispatch:
+
+# Lets this workflow publish the .ipa under Releases, so the repository's
+# "Workflow permissions" setting can stay on its read-only default.
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: iOS Build
+    # The app's deployment target is iOS 27.0, which needs Xcode 27.
+    # GitHub provides Xcode 27 on the "xcode-27" image; "macos-latest"
+    # still carries Xcode 26 and cannot build this project.
+    runs-on: xcode-27
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROJECT_NAME: DeviceDesk.xcodeproj
+      SCHEME: DeviceDesk
+      CONFIGURATION: Release
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v6
+
+      - name: Find the project and check Xcode
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(find . -type d -name "$PROJECT_NAME" -not -path './.git/*' -print -quit)"
+          if [ -z "$PROJECT" ]; then
+            echo "::error::$PROJECT_NAME was not found in this repository. Upload the whole DeviceDesk-iOS folder, including its iOS subfolder."
+            exit 1
+          fi
+          echo "Project: $PROJECT"
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+
+          xcodebuild -version
+          XCODE_DESC="$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')"
+          echo "XCODE_DESC=$XCODE_DESC" >> "$GITHUB_ENV"
+
+          SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
+          TARGET="$(sed -nE 's/.*IPHONEOS_DEPLOYMENT_TARGET"? = "?([0-9]+(\.[0-9]+)?).*/\1/p' "$PROJECT/project.pbxproj" | sort -t. -k1,1n -k2,2n | tail -n 1)"
+          echo "iOS SDK: $SDK   Deployment target: ${TARGET:-not found}"
+
+          as_number() { echo "$1" | awk -F. '{ printf "%d", $1 * 1000 + $2 }'; }
+          if [ -n "$TARGET" ] && [ "$(as_number "$SDK")" -lt "$(as_number "$TARGET")" ]; then
+            echo "::error::This runner's Xcode has the iOS $SDK SDK, but the project targets iOS $TARGET. Use a runner image whose Xcode includes that SDK."
+            exit 1
+          fi
+
+      - name: Build the app (unsigned)
+        id: build
+        run: |
+          set -euo pipefail
+
+          # CODE_SIGNING_ALLOWED=NO     -> no Apple developer account or certificate needed.
+          # SWIFT_COMPILATION_MODE=...  -> the usual Release setting; the project leaves it unset.
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SWIFT_COMPILATION_MODE=wholemodule \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: List build errors
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          FOUND="$(grep -E 'error: |^ld: |Undefined symbols? ' "$LOG" | sed "s|$GITHUB_WORKSPACE/||g" | awk '!seen[$0]++' | head -n 40 || true)"
+          if [ -z "$FOUND" ]; then
+            FOUND="No lines marked as errors were found. Open the 'Build the app (unsigned)' step for the full log."
+          fi
+          echo "$FOUND"
+          {
+            echo "### Build errors"
+            echo
+            echo '```text'
+            echo "$FOUND"
+            echo '```'
+            echo
+            echo "Copy the block above when asking for help with the build."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package the .ipa
+        run: |
+          set -euo pipefail
+
+          PRODUCTS="$RUNNER_TEMP/DerivedData/Build/Products/$CONFIGURATION-iphoneos"
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::The build finished but no .app bundle was found in $PRODUCTS."
+            exit 1
+          fi
+
+          plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$APP/Info.plist" 2>/dev/null || true; }
+          NAME="$(basename "$APP" .app)"
+          EXECUTABLE="$(plist CFBundleExecutable)"
+          VERSION="$(plist CFBundleShortVersionString)"
+          BUILD="$(plist CFBundleVersion)"
+          BUNDLE_ID="$(plist CFBundleIdentifier)"
+          MIN_OS="$(plist MinimumOSVersion)"
+          if [ -z "$EXECUTABLE" ] || [ ! -f "$APP/$EXECUTABLE" ]; then
+            echo "::error::$NAME.app has no executable, so the build did not produce a usable app."
+            exit 1
+          fi
+          ARCHS="$(lipo -archs "$APP/$EXECUTABLE" 2>/dev/null || echo unknown)"
+
+          # An .ipa is a zip archive holding the app inside a folder named Payload.
+          STAGE="$RUNNER_TEMP/ipa"
+          IPA="$RUNNER_TEMP/$NAME-unsigned.ipa"
+          rm -rf "$STAGE" "$IPA"
+          mkdir -p "$STAGE/Payload"
+          cp -R "$APP" "$STAGE/Payload/"
+          (cd "$STAGE" && zip -qry "$IPA" Payload)
+          SIZE_KB=$(( ($(wc -c < "$IPA") + 1023) / 1024 ))
+
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+          echo "APP_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=v${VERSION:-1.0}" >> "$GITHUB_ENV"
+          {
+            echo "### $NAME-unsigned.ipa"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | ${VERSION:-?} (${BUILD:-?}) |"
+            echo "| Bundle identifier | \`${BUNDLE_ID:-?}\` |"
+            echo "| Requires | iOS ${MIN_OS:-?} or later |"
+            echo "| Architectures | $ARCHS |"
+            echo "| Built with | $XCODE_DESC |"
+            echo "| Size | $SIZE_KB KB |"
+            echo
+            echo "This build is not code-signed. It has to be signed when it is installed."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep a copy on the run page
+        uses: actions/upload-artifact@v7
+        with:
+          name: DeviceDesk-unsigned-ipa
+          path: ${{ env.IPA }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          TITLE="$APP_NAME ${RELEASE_TAG#v} (unsigned)"
+          NOTES="Unsigned build of commit ${GITHUB_SHA:0:7}, made with $XCODE_DESC in workflow run #$GITHUB_RUN_NUMBER. Sign it when you install it."
+
+          # Running the workflow again replaces the .ipa in the same release.
+          publish() {
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release upload "$RELEASE_TAG" "$IPA" --clobber &&
+                gh release edit "$RELEASE_TAG" --notes "$NOTES"
+            else
+              gh release create "$RELEASE_TAG" "$IPA" --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES"
+            fi
+          }
+
+          if ! publish; then
+            echo "::error::Could not publish to Releases. In this repository open Settings > Actions > General > Workflow permissions, choose 'Read and write permissions', save, and run the workflow again. This run's .ipa is still available under Artifacts on the run's Summary page."
+            exit 1
+          fi
+
+          URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+          echo "::notice::Download the .ipa from $URL"
+          echo "Download it from the [$RELEASE_TAG release]($URL)." >> "$GITHUB_STEP_SUMMARY"
