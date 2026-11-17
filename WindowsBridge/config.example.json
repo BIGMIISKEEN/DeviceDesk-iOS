@@ -1,0 +1,17 @@
+{
+  "bind": "127.0.0.1",
+  "port": 9443,
+  "allowedHosts": ["devicedesk.example.internal"],
+  "certificate": "certificates/server-fullchain.pem",
+  "privateKey": "certificates/server-key.pem",
+  "winrmHTTPS": true,
+  "directoryServer": "dc01.example.internal",
+  "operators": [
+    {
+      "id": "technician1",
+      "tokenSHA256": "REPLACE_WITH_GENERATED_HASH",
+      "targets": ["PC001.example.internal"],
+      "actions": ["Inventory", "DriverUpdates", "DirectorySearch"]
+    }
+  ]
+}
